@@ -472,6 +472,14 @@ def usage():
      | Positive interval refers to NS loop, negative to initial walks
      | default:'' 
 
+    ``rigid_bonds=[ T | F ]``
+     | default: F
+     | Used when performing nested sampling with rigid molecules.
+
+     ``molecule_size=int``
+     | Used to help ascribe correct velocities when performing nested sampling with molecular species.
+     | default: 1
+
     """
     sys.stderr.write("Usage: %s [ -no_mpi ] < input\n" % sys.argv[0])
     sys.stderr.write("input:\n")
@@ -739,7 +747,7 @@ def propagate_NVE_ASE(at, dt, n_steps):
 
     vv.run(n_steps)
 
-def propagate_lammps(at, dt, n_steps, algo, Emax=None):
+def propagate_lammps(at, dt, n_steps, algo, Emax=None, rigid=None):
     if pot.first_propagate:
         pot.first_propagate=False
     else:
@@ -747,7 +755,10 @@ def propagate_lammps(at, dt, n_steps, algo, Emax=None):
 
     # set appropriate fix
     if algo == 'NVE':
-        pot.lmp.command('fix 1 all nve') 
+        if not rigid:
+            pot.lmp.command('fix 1 all nve') 
+        else:
+            pot.lmp.command('fix 1 all rigid/nve molecule')
     elif algo == 'GMC':
         # hard coded value needed for LAMMPS.  Let's hope our RNG maximum is at least this large
         pot.lmp.command('fix 1 all gmc {} {} '.format(rng.int_uniform(1,900000000),Emax))
@@ -773,12 +784,13 @@ def propagate_lammps(at, dt, n_steps, algo, Emax=None):
 
     return True
 
-def velo_rv_mag(n):
-    if movement_args['2D']:
-        #unit_rv[:,2] = 0.0 # commented out from here, as unit_rv is unknown to this function at this point
-        nDOF = 2.0
-    else:
-        nDOF = 3.0
+def velo_rv_mag(n,nDOF=None):
+    if nDOF is None:
+        if movement_args['2D']:
+            #unit_rv[:,2] = 0.0 # commented out from here, as unit_rv is unknown to this function at this point
+            nDOF = 2.0
+        else:
+            nDOF = 3.0
     # In 3D rv_mag should have prob distrib p(r) = r^(3N-1).
     # Using transformation rule p(y) = p(x) |dx/dy|, with p(y) = y^{3N-1} and p(x) = 1,
     #       one gets dx/dy = y^{3N-1}
@@ -788,6 +800,7 @@ def velo_rv_mag(n):
 
 def velo_unit_rv(n):
     unit_rv = rng.normal( 1.0, (n, 3) )
+    #unit_rv[n//2:]=0
     unit_rv /= np.linalg.norm(unit_rv)
     return unit_rv
 
@@ -809,6 +822,134 @@ def gen_random_velo(at, KEmax, unit_rv=None):
     velocities = rv_mag * np.sqrt(2.0/np.array([masses,]*3).transpose()) * np.sqrt(KEmax) * unit_rv
 
     return velocities
+
+def gen_random_velo_mole(at, KEmax, unit_rv=None, mol_size=1):
+    """Generates random velocities for molecular systems. For use with rigid_bonds, otherwise,
+    you should be using gen_random_velo"""
+    nmols = len(at)//mol_size
+    nDOF=6
+    if unit_rv is None:
+        unit_rv = velo_unit_rv(2*nmols)
+    if movement_args['2D']:
+        unit_rv[:,2] = 0.0
+    rv_mag = velo_rv_mag(2*nmols, nDOF=nDOF)
+
+    at_velocities = np.zeros((len(at),3))
+    at.wrap()
+    #calculating rotational and translational velocities per molecule, and assigning the components to
+    #consituent particles
+    for i in range(nmols):
+        mass = at[i*mol_size:i*mol_size+mol_size].get_masses().sum()
+        trans_component = rv_mag * np.sqrt(2.0/np.array([mass,]*3).transpose()) * np.sqrt(KEmax) * unit_rv[i]
+
+        try:
+            I,evecs = get_moments_of_inertia_mic(at[i*mol_size:i*mol_size+mol_size],True) #
+        except np.linalg.LinAlgError:
+            print("Eigenvalues did not converge")
+            ase.io.write("unconverged.extxyz", at)
+            exit()
+        rot_velocity  = rv_mag * np.sqrt(2.0/I.T) * np.sqrt(KEmax) * unit_rv[i+nmols]
+        
+        _, dist_vecs = get_center_of_mass_mic(at[i*mol_size:i*mol_size+mol_size],True)
+        new_basis_dist_vecs = np.dot(evecs,dist_vecs.T)
+        rot_component = np.cross(rot_velocity,new_basis_dist_vecs,axisa=0,axisb=0)
+
+        at_velocities[i*mol_size:i*mol_size+mol_size] = np.dot(rot_component,evecs)+trans_component
+        
+    return at_velocities
+
+def get_center_of_mass_mic(at, dist_vecs=False):
+    """Obtains centre of mass of a molecule accounting for the minimum image convention.
+
+    WARNING: may output a position outside the box, but this position can be wrapped back inside the box
+    and it will be the correct centre of mass for the molecule"""
+    dists = at.get_distances(0,range(len(at)),True,True)
+    positions = dists + at[0].position
+    masses = at.get_masses()
+    com = (masses @ dists / masses.sum())+at.positions[0]
+
+    if dist_vecs:
+        return com, positions - com
+    else:
+        return com
+
+def get_moments_of_inertia_mic(at, vectors=False):
+    """Get the moments of inertia along the principal axes.
+
+    The three principal moments of inertia are computed from the
+    eigenvalues of the symmetric inertial tensor. Periodic boundary
+    conditions are NOT ignored.
+    """
+    
+    at.positions = at.get_distances(0,range(len(at)),True,True)+at[0].position
+    com = at.get_center_of_mass()
+    positions = at.get_positions().copy()
+    positions -= com  # translate center of mass to origin
+    masses = at.get_masses()
+
+    # Initialize elements of the inertial tensor
+    I11 = I22 = I33 = I12 = I13 = I23 = 0.0
+    for i in range(len(at)):
+        x, y, z = positions[i]
+        m = masses[i]
+
+        I11 += m * (y ** 2 + z ** 2)
+        I22 += m * (x ** 2 + z ** 2)
+        I33 += m * (x ** 2 + y ** 2)
+        I12 += -m * x * y
+        I13 += -m * x * z
+        I23 += -m * y * z
+
+    Itensor = np.array([[I11, I12, I13],
+                        [I12, I22, I23],
+                        [I13, I23, I33]])
+    
+
+    evals, evecs = np.linalg.eigh(Itensor)
+    if vectors:
+        return evals, evecs.transpose()
+    else:
+        return evals
+ 
+def unwrap_pos(at,molsize):
+    """Unwrap the coordinates of the molecules such that they DO cross boundaries
+    For correct dynamics."""
+    #Should be a method? may need to refactor at some point
+    nmols = len(at)//molsize
+    new_pos=[]
+    for imol in range(nmols):
+        mol=at[imol*molsize:imol*molsize+molsize]
+        new_pos.append(mol.get_distances(0,range(len(mol)),True,True)+mol[0].position)
+    new_pos = np.array(new_pos)
+    new_pos = np.reshape(new_pos,[-1,3])
+    at.set_positions(new_pos)
+
+def set_cell_rigid(at, cell, molecule_size = 1):
+
+    """Set the cell of the system. This maintains the fractional positions of the
+    first atom in the molecule, to avoid distorting molecular systems especially for use with rigid bonds
+    """
+
+
+    nmols = len(at)//molecule_size
+
+    intramol_dists = np.array([at.get_distances(at_idx,range(at_idx,at_idx+molecule_size),vector=True,mic=True) 
+                     for at_idx in range(0,len(at),molecule_size)])
+    first_atom_frac_pos = at.get_scaled_positions(wrap=False)
+
+    at.set_cell(cell,scale_atoms=True)
+
+    first_atom_positions = at.get_positions()[::molecule_size]
+    first_atom_positions = np.repeat(first_atom_positions,molecule_size,axis=0)
+
+    intramol_dists = intramol_dists.reshape(-1,3)
+    new_positions = first_atom_positions+intramol_dists
+    at.set_positions(new_positions)
+    at.calc.set_cell(at,change=True)
+    at.calc.set_lammps_pos(at)
+
+    return
+
 
 def pairwise(iterable):
     a = iter(iterable)
@@ -851,10 +992,12 @@ def rej_free_perturb_velo(at, Emax, KEmax, rotate=True):
     if not at.has('momenta') or not at.has('masses'):
         return
 
+
     KEmax_use = None
     if Emax is not None:
         initial_KE = eval_energy_KE(at)
         KEmax_use = Emax - (at.info['ns_energy'] - initial_KE)
+
     if KEmax > 0.0:
         if Emax is None:
             KEmax_use = KEmax
@@ -863,29 +1006,45 @@ def rej_free_perturb_velo(at, Emax, KEmax, rotate=True):
     if KEmax_use is None:
         exit_error("rej_free_perturb_velo() called with Emax and KEmax both None\n", 9)
 
+
     orig_KE = at.get_kinetic_energy( )
     #DOC \item if atom\_velo\_rej\_free\_fully\_randomize, pick random velocities consistent with Emax
     if movement_args['atom_velo_rej_free_fully_randomize']:
         # randomize completely
-        at.set_velocities(gen_random_velo(at, KEmax_use))
+        if movement_args['molecule_size'] <= 1:
+            at.set_velocities(gen_random_velo(at, KEmax_use))
+        else:
+            at.set_velocities(gen_random_velo_mole(at, KEmax_use,mol_size=movement_args['molecule_size']))
     #DOC \item else perturb velocities
     else: # perturb
         velo = at.get_velocities()
 
+
         velo_mag = np.linalg.norm(velo)
         #DOC \item if current velocity=0, can't rescale, so pick random velocities consistent with Emax
         if velo_mag == 0.0:
-            at.set_velocities(gen_random_velo(at, KEmax_use))
+
+            if movement_args['molecule_size'] <= 1:
+                at.set_velocities(gen_random_velo(at, KEmax_use))
+            else:
+                at.set_velocities(gen_random_velo_mole(at, KEmax_use,mol_size=movement_args['molecule_size']))
 
         #DOC \item else, pick new random magnitude consistent with Emax, random rotation of current direction with angle uniform in +/- atom\_velo\_rej\_free\_perturb\_angle
         else:
             # pick new random magnitude - count on dimensionality to make change small
             # WARNING: check this for variable masses
 
+
+
             sqrt_masses_2D = np.sqrt(at.get_masses().reshape( (len(at),1) ))
-            scaled_vel = gen_random_velo(at, KEmax_use, velo/velo_mag) * sqrt_masses_2D
+            if movement_args['molecule_size'] <= 1:
+                scaled_vel = gen_random_velo(at, KEmax_use, velo/velo_mag) * sqrt_masses_2D
+            else:
+                scaled_vel = gen_random_velo_mole(at, KEmax_use, velo/velo_mag, mol_size=movement_args['molecule_size'])  * sqrt_masses_2D
+
 
             if rotate:
+
                 if movement_args['2D']:
                     rotate_dir_3N_2D(scaled_vel, movement_args['atom_velo_rej_free_perturb_angle'])
                 else:
@@ -896,6 +1055,8 @@ def rej_free_perturb_velo(at, Emax, KEmax, rotate=True):
     new_KE = at.get_kinetic_energy()
 
     # rej_free_perturb_velo expects at.info['ns_energy'] to be set correctly initially
+
+
     at.info['ns_energy'] += new_KE-orig_KE
 
 def do_MC_atom_velo_walk(at, movement_args, Emax, nD, KEmax):
@@ -904,6 +1065,7 @@ def do_MC_atom_velo_walk(at, movement_args, Emax, nD, KEmax):
 
     #DOC \item Else if MC\_atom\_velo\_walk\_rej\_free
     if movement_args['MC_atom_velo_walk_rej_free']:
+
         #DOC \item call rej\_free\_perturb\_velo()
             rej_free_perturb_velo(at, Emax, KEmax)
             return {}
@@ -934,6 +1096,8 @@ def do_MC_atom_velo_walk(at, movement_args, Emax, nD, KEmax):
             for i_at in at_list:
                 d_KE = 0.5*masses[i_at]*(np.sum((velocities[i_at,:]+d_vel[i_at,:])**2) - np.sum(velocities[i_at,:]**2))
                 if KE + d_KE < KEmax_use:
+
+
                     velocities[i_at,:] += d_vel[i_at,:]
                     KE += d_KE
                     n_accept += 1
@@ -943,6 +1107,7 @@ def do_MC_atom_velo_walk(at, movement_args, Emax, nD, KEmax):
     return {'MC_atom_velo' : (n_try, n_accept)}
 
 def do_MD_atom_walk(at, movement_args, Emax, KEmax):
+
 #DOC
 #DOC ``do_MD_atom_walk``
 
@@ -966,6 +1131,7 @@ def do_MD_atom_walk(at, movement_args, Emax, KEmax):
 
     pre_MD_E = at.info['ns_energy']
 
+
     #DOC \item propagate in time atom\_traj\_len time steps of length MD\_atom\_timestep
     if movement_args['python_MD']:
         forces = eval_forces(at)
@@ -987,12 +1153,13 @@ def do_MD_atom_walk(at, movement_args, Emax, KEmax):
             propagate_NVE_ASE(at, dt=movement_args['MD_atom_timestep'], n_steps=movement_args['atom_traj_len'])
             final_E = eval_energy(at)
         elif do_calc_lammps:
-
-            if propagate_lammps(at, dt=movement_args['MD_atom_timestep'], n_steps=movement_args['atom_traj_len'], algo='NVE'):
+            if propagate_lammps(at, dt=movement_args['MD_atom_timestep'], n_steps=movement_args['atom_traj_len'], algo='NVE',rigid=movement_args["rigid_bonds"]):  
                 final_E = pot.results['energy'] + eval_energy(at, do_PE=False)
+
             else: # propagate returned success == False
+
                 final_E = 2.0*abs(Emax)
-                ## print("error in propagate_lammps NVE, setting final_E = 2*abs(Emax) =" , final_E)
+                #print("error in propagate_lammps NVE, setting final_E = 2*abs(Emax) =" , final_E)
 
         elif do_calc_fortran:
             final_E = f_MC_MD.MD_atom_NVE_walk(at, n_steps=movement_args['atom_traj_len'], timestep=movement_args['MD_atom_timestep'], debug=ns_args['debug'])
@@ -1002,6 +1169,7 @@ def do_MD_atom_walk(at, movement_args, Emax, KEmax):
 
     reject_fuzz = False
     final_KE = eval_energy_KE(at)
+
     #DOC \item If MD\_atom\_reject\_energy\_violation is set, accept/reject entire move on E deviating by less than MD\_atom\_energy\_fuzz times kinetic energy
     if abs(final_E-pre_MD_E) > movement_args['MD_atom_energy_fuzz']*final_KE:
         if movement_args['MD_atom_reject_energy_violation']:
@@ -1036,8 +1204,12 @@ def do_MD_atom_walk(at, movement_args, Emax, KEmax):
         n_accept = 1
 
     #DOC \item if MD\_atom\_velo\_post\_perturb, call do\_MC\_atom\_velo\_walk() for magnitude and rotation
+
     if movement_args['MD_atom_velo_post_perturb']:
+
         do_MC_atom_velo_walk(at, movement_args, Emax, nD, KEmax)
+
+
 
     return {'MD_atom' : (1, n_accept) }
 
@@ -1058,6 +1230,7 @@ def do_MC_atom_walk(at, movement_args, Emax, KEmax):
 
     #DOC \item if MC\_atom\_velocities and MC\_atom\_velocities\_pre\_perturb, call do\_MC\_atom\_velo\_walk() to perturb velocities, magnitude and and rotation
     if movement_args['MC_atom_velocities'] and movement_args['MC_atom_velocities_pre_perturb']:
+
         do_MC_atom_velo_walk(at, movement_args, Emax, nD, KEmax)
 
     if movement_args['MC_atom_Galilean']:
@@ -1362,7 +1535,10 @@ def do_cell_step(at, Emax, p_accept, transform):
         extra_data = at.arrays['ns_extra_data'].copy()
 
     # set new positions and velocities
-    at.set_cell(new_cell, scale_atoms=True)
+    if not movement_args["rigid_bonds"]:
+        at.set_cell(new_cell, scale_atoms=True)
+    else:
+        set_cell_rigid(at,new_cell, molecule_size = movement_args["molecule_size"])
 
     if Emax is None:
         return
@@ -1381,7 +1557,11 @@ def do_cell_step(at, Emax, p_accept, transform):
         at.info['ns_energy'] = new_energy
         return True
     else: # reject and revert
-        at.set_cell(orig_cell,scale_atoms=False)
+        if not movement_args["rigid_bonds"]:
+            at.set_cell(orig_cell,scale_atoms=False)
+        else:
+            set_cell_rigid(at,new_cell, molecule_size = movement_args["molecule_size"])
+
         at.set_positions(orig_pos)
         if ns_args['n_extra_data'] > 0:
             at.arrays['ns_extra_data'][...] = extra_data
@@ -1562,8 +1742,10 @@ def do_atom_walk(at, movement_args, Emax, KEmax):
     #DOC \item loop n\_atom\_steps\_per\_call times, calling do\_MC\_atom\_walk() or do\_MD\_atom\_walk()
     for i in range(n_reps):
         if movement_args['atom_algorithm'] == 'MC':
+
             accumulate_stats(out, do_MC_atom_walk(at, movement_args, Emax, KEmax))
         elif movement_args['atom_algorithm'] == 'MD':
+
             accumulate_stats(out, do_MD_atom_walk(at, movement_args, Emax, KEmax))
         else:
             exit_error("do_atom_walk got unknown 'atom_algorithm' = '%s'\n" % movement_args['atom_algorithm'], 5)
@@ -1593,6 +1775,8 @@ def rand_perturb_energy(energy, perturbation, Emax=None):
                 pert = 1.0 + rng.float_uniform(-1.0,0.0)*perturbation
                 n_tries += 1
             if energy*pert >= Emax:
+                print("Emax", Emax, "energy", energy, "pert", pert)
+
                 print( print_prefix, "WARNING: failed to do random energy perturbation below Emax ", energy, Emax)
             energy *= pert
 
@@ -1637,6 +1821,9 @@ def walk_single_walker(at, movement_args, Emax, KEmax):
 #DOC
 #DOC ``walk_single_walker``
 
+
+
+
     out = {}
 
     if movement_args['do_good_load_balance']:
@@ -1665,6 +1852,9 @@ def walk_single_walker(at, movement_args, Emax, KEmax):
             accumulate_stats(out, t_out)
 
     else:
+
+
+
         #DOC \item create list
                             #DOC \item do\_atom\_walk :math:`*` n\_atom\_step\_n\_calls
         possible_moves = ( [do_atom_walk] * movement_args['n_atom_steps_n_calls'] +
@@ -1682,19 +1872,32 @@ def walk_single_walker(at, movement_args, Emax, KEmax):
         out = {}
         n_model_calls_used=0
 
+
+
         #DOC \item loop while n\_model\_calls\_used < n\_model\_calls
         while n_model_calls_used < movement_args['n_model_calls']:
+
+
             #DOC \item pick random item from list
             move = possible_moves[rng.int_uniform(0,len(possible_moves))]
+            
+
+
             #DOC \item do move
             (t_n_model_calls, t_out) = move(at, movement_args, Emax, KEmax)
             n_model_calls_used += t_n_model_calls
             accumulate_stats(out, t_out)
 
 
+
+
     #DOC \item perturb final energy by random\_energy\_perturbation
     # perturb final energy
+
     at.info['ns_energy'] = rand_perturb_energy(at.info['ns_energy'],ns_args['random_energy_perturbation'],Emax)
+
+    
+
 
     #DEBUG print("walk_single_walker end ", eval_energy(at, do_PE=False), eval_energy(at) #DEBUG)
 
@@ -2340,6 +2543,7 @@ def do_ns_loop():
             ns_analyzer.analyze(walkers, -1, "NS_loop start")
 
     # START MAIN LOOP
+
     i_ns_step = start_first_iter
     while ns_args['n_iter'] < 0 or i_ns_step < ns_args['n_iter']:
         check_memory.check_memory("start_ns_main_loop")
@@ -2605,8 +2809,8 @@ def do_ns_loop():
 
         if n_cull == 1:
             if send_rank[0] == recv_rank[0] and send_rank[0] == rank: # local copy
-                walkers[recv_ind[0]].set_positions(walkers[send_ind[0]].get_positions())
                 walkers[recv_ind[0]].set_cell(walkers[send_ind[0]].get_cell())
+                walkers[recv_ind[0]].set_positions(walkers[send_ind[0]].get_positions())
                 if movement_args['do_velocities']:
                     walkers[recv_ind[0]].set_velocities(walkers[send_ind[0]].get_velocities())
                 if movement_args['do_GMC']:
@@ -2661,8 +2865,8 @@ def do_ns_loop():
                 elif recv_rank[0] == rank:
                     comm.Recv([buf, MPI.DOUBLE], source=send_rank[0], tag=100)
                     buf_o = 0
-                    walkers[recv_ind[0]].set_positions(buf[buf_o:buf_o+3*n_atoms].reshape( (n_atoms, 3) )); buf_o += 3*n_atoms
                     walkers[recv_ind[0]].set_cell(buf[buf_o:buf_o+3*3].reshape( (3, 3) )); buf_o += 3*3
+                    walkers[recv_ind[0]].set_positions(buf[buf_o:buf_o+3*n_atoms].reshape( (n_atoms, 3) )); buf_o += 3*n_atoms
                     if movement_args['do_velocities']:
                         walkers[recv_ind[0]].set_velocities(buf[buf_o:buf_o+3*n_atoms].reshape( (n_atoms, 3) )); buf_o += 3*n_atoms
                     if movement_args['do_GMC']:
@@ -2769,8 +2973,9 @@ def do_ns_loop():
 
                 data_o = recv_displ_t[r_send]
                 walkers[i_recv].info['ns_energy'] = recv_data[data_o]; data_o += 1
-                walkers[i_recv].set_positions( recv_data[data_o:data_o+3*n_atoms].reshape( (n_atoms, 3) )); data_o += 3*n_atoms
                 walkers[i_recv].set_cell( recv_data[data_o:data_o+3*3].reshape( (3, 3) )); data_o += 3*3
+                walkers[i_recv].set_positions( recv_data[data_o:data_o+3*n_atoms].reshape( (n_atoms, 3) )); data_o += 3*n_atoms
+
                 if movement_args['do_velocities']:
                     walkers[i_recv].set_velocities( recv_data[data_o:data_o+3*n_atoms].reshape( (n_atoms, 3) )); data_o += 3*n_atoms
                 if movement_args['do_GMC']:
@@ -3255,6 +3460,7 @@ def main():
         movement_args['n_model_calls_expected'] = int(args.pop('n_model_calls_expected', 0))
         movement_args['n_model_calls'] = int(args.pop('n_model_calls', 0))
         movement_args['do_good_load_balance'] = str_to_logical(args.pop('do_good_load_balance', "F"))
+    
 
         #DOC \item process n\_atom\_steps
             #DOC \item If break\_up\_atom\_traj
@@ -3291,6 +3497,10 @@ def main():
         movement_args['no_swap_velo_fix_mag_alt'] = str_to_logical(args.pop('no_swap_velo_fix_mag_alt', "F"))
 
         movement_args['n_semi_grand_steps'] = int(args.pop('n_semi_grand_steps', 0))
+
+        movement_args['molecule_size'] = int(args.pop('molecule_size', 1))  #used to make sure velocities assigned properly for molecular systems
+        movement_args["rigid_bonds"] = str_to_logical(args.pop("rigid_bonds","F"))
+
         if movement_args['n_semi_grand_steps'] > 0:
             try:
                 m = re.match('\s*{([^}]*)}\s*$', args.pop('semi_grand_potentials'))
@@ -3672,8 +3882,8 @@ def main():
             # initial positions are just random, up to an energy ceiling
             for (i_at, at) in enumerate(walkers):
                 # randomize cell if P is set, both volume (from appropriate distribution) and shape (from uniform distribution with min aspect ratio limit)
-
                 if ns_args['random_initialise_cell']:
+
                     energy = float('nan')
                     if movement_args['MC_cell_P'] > 0.0:
                         if movement_args['2D']:
@@ -3739,6 +3949,7 @@ def main():
                     exit_error("do_velocities is set, but neither KEmax_max_T nor MC_cell_P are > 0, so no heuristic for setting KEmax",4)
                 for at in walkers:
                     at.info['KEmax']=KEmax
+
             else:
                 KEmax = -1.0
 
@@ -3762,7 +3973,11 @@ def main():
                 if np.any(at.get_atomic_numbers() != walkers[0].get_atomic_numbers()):
                     ns_args['swap_atomic_numbers'] = True
 
-            # broadcast swap_atomic_numbers in case it was overriddgen to True by presence of configurations with different atomic number lists
+            if movement_args['molecule_size'] > 1:
+                for at in walkers:
+                    unwrap_pos(at,movement_args['molecule_size'])
+                    
+            # broadcast swap_atomic_numbers in case it was overridden to True by presence of configurations with different atomic number lists
             if comm is not None:
                 ns_args['swap_atomic_numbers'] = comm.bcast(ns_args['swap_atomic_numbers'], root=0)
 

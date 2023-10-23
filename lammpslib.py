@@ -271,6 +271,17 @@ End LAMMPSlib Interface Documentation
         read_molecular_info=False,
         comm=None)
 
+    def parse_mol_ids(self,atoms):
+        atoms.mol_ids = []
+        for i in range(len(atoms)):
+            if atoms.arrays['mol_ids'][i] != '_':
+                atoms.mol_ids.append((atoms.arrays['mol_ids'][i], i+1))
+   
+    def set_mol_ids(self, atoms):
+        for (i1, mol_id) in atoms.mol_ids:
+            self.lmp.command('set atom {} mol {}'.format(mol_id, i1))
+
+
     def parse_bonds(self, atoms):
         atoms.bonds = []
         atoms.max_n_bonds = 0
@@ -280,7 +291,7 @@ End LAMMPSlib Interface Documentation
                 for bond_list in atoms.arrays['bonds'][i].split(','):
                     n_bonds += 1
                     m = re.match('(\d+)\((\d+)\)',bond_list)
-                    atoms.bonds.append((int(m.group(2)),i+1,int(m.group(1))+1))
+                    atoms.bonds.append((int(m.group(2)), i+1, int(m.group(1))+1))
                 atoms.max_n_bonds = max(atoms.max_n_bonds, n_bonds)
 
     def set_bonds(self, atoms):
@@ -296,14 +307,14 @@ End LAMMPSlib Interface Documentation
                 for angle_list in atoms.arrays['angles'][i].split(','):
                     n_angles += 1
                     m = re.match('(\d+)\-(\d+)\((\d+)\)',angle_list)
-                    atoms.angles.append((int(m.group(3)),int(m.group(1))+1,i+1,int(m.group(2))+1))
+                    atoms.angles.append((int(m.group(3)),int(m.group(1))+1, i+1, int(m.group(2))+1))
                 atoms.max_n_angles = max(atoms.max_n_angles, n_angles)
 
     def set_angles(self, atoms):
         for (t, i1, i2, i3) in atoms.angles:
             self.lmp.command('create_bonds single/angle {} {} {} {}'.format(t, i1, i2, i3))
 
-    def parse_dihedrals(self,atoms):
+    def parse_dihedrals(self, atoms):
         atoms.dihedrals = []
         atoms.max_n_dihedrals = 0
         for i in range(len(atoms)):
@@ -364,7 +375,6 @@ End LAMMPSlib Interface Documentation
 
     def set_lammps_pos(self, atoms):
         pos = atoms.get_positions() / unit_convert("distance", self.units)
-
         # If necessary, transform the positions to new coordinate system
         if self.coord_transform is not None:
             pos = np.dot(self.coord_transform , np.matrix.transpose(pos))
@@ -372,13 +382,77 @@ End LAMMPSlib Interface Documentation
 
         # Convert ase position matrix to lammps-style position array
         lmp_positions = list(pos.ravel())
+        #print(atoms.positions.ravel()-lmp_positions)
 
         # Convert that lammps-style array into a C object
         lmp_c_positions =\
             (ctypes.c_double * len(lmp_positions))(*lmp_positions)
+        
+        # print(lmp_positions)
+        # print("cmon_bruh")
 #        self.lmp.put_coosrds(lmp_c_positions)
         self.lmp.scatter_atoms('x', 1, 3, lmp_c_positions)
+        self.lmp.command("set group all image 0 0 0")
+        self.lmp.command("reset_atoms image all")
 
+
+        #new_pos = np.array([x for x in self.lmp.gather_atoms("x",1,3)]).reshape(-1,3)
+
+
+        #ase.io.write("inside_set.extxyz", ase.Atoms("96C", new_pos,pbc=False))
+        #self.lmp.command("write_dump all custom inside_set.atom id mol xu yu zu vx vy vz ix iy iz")
+
+
+    def reset_image_flags(self,atoms,counter=0):
+
+        """Unwrap the coordinates of the molecules such that they DO cross boundaries
+        For correct dynamics."""
+        #Should be a method? may need to refactor at some point
+
+
+        molsize = 6 #lazy way VERY TEMPORARY, assumes molecules the same size OMAR
+
+        if molsize <= 1:
+            return
+        
+        atoms.wrap()
+        nmols = len(atoms)//molsize
+        new_pos = []
+        for imol in range(nmols):
+            mol = atoms[imol*molsize:imol*molsize+molsize]
+            new_pos.append(mol.get_distances(0,range(len(mol)),True,True)+mol[0].position)
+        new_pos = np.array(new_pos)
+        new_pos = np.reshape(new_pos,[-1,3])
+        atoms.wrap()
+
+        # if counter > 1:
+        #     self.lmp.command("write_dump all custom pre_set_positions.atom id mol xu yu zu vx vy vz ix iy iz")
+        atoms.set_positions(new_pos)
+        # if counter > 1:
+        #     ase.io.write("wrap.extxyz",atoms)
+        #     self.lmp.command("write_dump all custom post_set_positions.atom id mol xu yu zu vx vy vz ix iy iz")
+        self.set_lammps_pos(atoms)
+        # if counter > 1:
+        #     self.lmp.command("write_dump all custom post_set_lammps_positions.atom id mol xu yu zu vx vy vz ix iy iz")
+        self.lmp.command('reset_atoms image all')
+        # if counter > 1:
+        #     self.lmp.command("write_dump all custom post_set_images.atom id mol xu yu zu vx vy vz ix iy iz")
+
+        #     print("done")
+        #     exit()
+
+        # self.set_lammps_pos(atoms)
+        # self.lmp.command('reset_atoms image all')
+        
+        
+
+        # fractional_positions = atoms.get_scaled_positions(wrap=False)
+        # # # Calculate the image flags for each atom
+        # image_flags = -1*np.floor(fractional_positions)
+        # # # Print the image flags for each atom
+        # for atom_index,image_flag in enumerate(image_flags):
+        #     if image_flag.any():
+        #         self.lmp.command(f"set atom {int(atom_index+1)} image {int(image_flag[0])} {int(image_flag[1])} {int(image_flag[2])}")
 
     def calculate(self, atoms, properties, system_changes):
         self.propagate(atoms, properties, system_changes, 0)
@@ -399,6 +473,7 @@ End LAMMPSlib Interface Documentation
         if len(system_changes) == 0:
             return
 
+
         self.coord_transform = None
 
         if not self.started:
@@ -408,6 +483,7 @@ End LAMMPSlib Interface Documentation
         #NB
         if not self.initialized:
             self.initialise_lammps(atoms)
+            #self.counter = 0 # OMAR
         else: # still need to reset cell
             # reset positions so that if they are cray from last propagation, change_box (in set_cell()) won't hang
             # could do this only after testing for crazy positions?
@@ -463,7 +539,22 @@ End LAMMPSlib Interface Documentation
                 self.lmp.command('timestep %.30f' % dt)
             else:
                 self.lmp.command('timestep %.30f' % ( dt/unit_convert("time", self.units)) )
+            
+
+        #atoms.wrap()
+            
+        if n_steps > 0:
+            self.reset_image_flags(atoms)
+        #     self.counter +=1
+        # if self.counter == 1:
+        #     self.lmp.command("dump mydump all custom 1 dump.atom id mol xu yu zu vx vy vz ix iy iz")
         self.lmp.command('run %d' % n_steps)
+
+        
+        # if self.counter > 2:
+        #     print(atoms.get_kinetic_energy())
+        #     exit()
+
 
         if n_steps > 0:
             # TODO this must be slower than native copy, but why is it broken?
@@ -622,6 +713,7 @@ End LAMMPSlib Interface Documentation
         self.started=True
 
     def initialise_lammps(self, atoms):
+        
 
         # Initialising commands
         if self.parameters.boundary:
@@ -689,6 +781,13 @@ End LAMMPSlib Interface Documentation
                m = re.match('\s*improper_coeff\s+(\d+)', cmd)
                if m is not None:
                    n_improper_types = max(int(m.group(1)), n_improper_types)
+                
+               m = re.match('\s*angle_coeff\s+([*]+)', cmd)
+               if m is not None:
+                   n_angle_types=1 #exception for rigid bonds
+               m = re.match('\s*bond_coeff\s+([*]+)', cmd)
+               if m is not None:
+                   n_bond_types=1 #exception for rigid bonds
 
            if self.parameters.read_molecular_info:
                if 'bonds' in atoms.arrays:
@@ -703,7 +802,8 @@ End LAMMPSlib Interface Documentation
                if 'impropers' in atoms.arrays:
                    self.parse_impropers(atoms)
                    create_box_command += ' improper/types {} extra/improper/per/atom {}'.format(n_improper_types,atoms.max_n_impropers)
-
+               if 'mol_ids' in atoms.arrays:
+                   self.parse_mol_ids(atoms)
            self.lmp.command(create_box_command)
 
         # Initialize the atoms with their types
@@ -752,6 +852,7 @@ End LAMMPSlib Interface Documentation
         self.lmp.command('variable pe equal pe')
 
         self.lmp.command("neigh_modify delay 0 every 1 check yes")
+        #self.lmp.command("comm_modify cutoff 15.0")
 
         if self.parameters.read_molecular_info:
             # read in bonds if there are bonds from the ase-atoms object if the molecular flag is set
@@ -766,6 +867,8 @@ End LAMMPSlib Interface Documentation
             # read in impropers if there are impropers from the ase-atoms object if the molecular flag is set
             if 'impropers' in atoms.arrays:
                 self.set_impropers(atoms)
+            if 'mol_ids' in atoms.arrays:
+                self.set_mol_ids(atoms)
 
         if self.parameters.read_molecular_info and 'mmcharge' in atoms.arrays: 
             self.set_charges(atoms)
