@@ -459,6 +459,9 @@ End LAMMPSlib Interface Documentation
 
     def propagate(self, atoms, properties, system_changes, n_steps, dt=None, dt_not_real_time=False, velocity_field=None):
 
+        #print("start propagate omar")
+
+
         """"atoms: Atoms object
             Contains positions, unit-cell, ...
         properties: list of str
@@ -542,15 +545,16 @@ End LAMMPSlib Interface Documentation
             
 
         #atoms.wrap()
-            
+        #print("pre run omar 0")
         if n_steps > 0:
             self.reset_image_flags(atoms)
+        #print("after reset omar 0")
         #     self.counter +=1
         # if self.counter == 1:
-        #     self.lmp.command("dump mydump all custom 1 dump.atom id mol xu yu zu vx vy vz ix iy iz")
+        self.lmp.command("write_dump all custom dump.atom id mol xs ys zs xu yu zu vx vy vz ix iy iz")
         self.lmp.command('run %d' % n_steps)
 
-        
+        #print("post run omar 0")
         # if self.counter > 2:
         #     print(atoms.get_kinetic_energy())
         #     exit()
@@ -620,6 +624,8 @@ End LAMMPSlib Interface Documentation
         if not self.parameters.keep_alive:
             self.lmp.close()
 
+        #print("fin propagate omar")
+
     def lammpsbc(self, pbc):
         if pbc:
             return 'p'
@@ -682,8 +688,11 @@ End LAMMPSlib Interface Documentation
         self.started=False
         self.initialized=False
         self.previous_atoms_numbers = []
+        print("before restart omar")
         self.start_lammps()
+        print("trying to restart omar")
         self.initialise_lammps(atoms)
+        print("after initialise omar")
 
     def start_lammps(self):
         # start lammps process
@@ -850,6 +859,7 @@ End LAMMPSlib Interface Documentation
 
         # do we need this if we extract from a global ?
         self.lmp.command('variable pe equal pe')
+        #self.lmp.command('compute pea all ke/atom') #OMAR
 
         self.lmp.command("neigh_modify delay 0 every 1 check yes")
         #self.lmp.command("comm_modify cutoff 15.0")

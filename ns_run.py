@@ -824,8 +824,8 @@ def gen_random_velo(at, KEmax, unit_rv=None):
     return velocities
 
 def gen_random_velo_mole(at, KEmax, unit_rv=None, mol_size=1):
-    """Generates random velocities for molecular systems. For use with rigid_bonds, otherwise,
-    you should be using gen_random_velo"""
+    """Generates random velocities for molecular systems. For use with rigid_bonds, if performing NS on 
+    soft bond potentials or single bodies you should be using gen_random_velo instead"""
     nmols = len(at)//mol_size
     nDOF=6
     if unit_rv is None:
@@ -845,9 +845,8 @@ def gen_random_velo_mole(at, KEmax, unit_rv=None, mol_size=1):
         try:
             I,evecs = get_moments_of_inertia_mic(at[i*mol_size:i*mol_size+mol_size],True) #
         except np.linalg.LinAlgError:
-            print("Eigenvalues did not converge")
-            ase.io.write("unconverged.extxyz", at)
-            exit()
+            print("Warning: Eigenvalues did not converge")
+            exit_error("Bad principal moments for rotational velocities \n",1)
         rot_velocity  = rv_mag * np.sqrt(2.0/I.T) * np.sqrt(KEmax) * unit_rv[i+nmols]
         
         _, dist_vecs = get_center_of_mass_mic(at[i*mol_size:i*mol_size+mol_size],True)
@@ -872,6 +871,22 @@ def get_center_of_mass_mic(at, dist_vecs=False):
         return com, positions - com
     else:
         return com
+
+
+def unwrap_pos(at,molsize):
+    """Unwrap the coordinates of the molecules such that they DO cross boundaries
+    For correct dynamics."""
+    #Should be a method? may need to refactor at some point
+    nmols = len(at)//molsize
+    new_pos=[]
+    for imol in range(nmols):
+        mol=at[imol*molsize:imol*molsize+molsize]
+        com,dists = get_center_of_mass_mic(mol,dist_vecs = True)
+        wrapped_com = ase.geometry.wrap_positions([com],mol.cell)
+        new_pos.append(np.array(wrapped_com+dists))
+    new_pos = np.array(new_pos)
+    new_pos = np.reshape(new_pos,[-1,3])
+    at.set_positions(new_pos)
 
 def get_moments_of_inertia_mic(at, vectors=False):
     """Get the moments of inertia along the principal axes.
@@ -930,11 +945,11 @@ def set_cell_rigid(at, cell, molecule_size = 1):
     first atom in the molecule, to avoid distorting molecular systems especially for use with rigid bonds
     """
 
+    intramol_dists = np.array([at.get_distances(at_idx,range(at_idx,at_idx+molecule_size),vector=True,mic=True) 
+                    for at_idx in range(0,len(at),molecule_size)])
 
     nmols = len(at)//molecule_size
 
-    intramol_dists = np.array([at.get_distances(at_idx,range(at_idx,at_idx+molecule_size),vector=True,mic=True) 
-                     for at_idx in range(0,len(at),molecule_size)])
     first_atom_frac_pos = at.get_scaled_positions(wrap=False)
 
     at.set_cell(cell,scale_atoms=True)
@@ -1158,6 +1173,7 @@ def do_MD_atom_walk(at, movement_args, Emax, KEmax):
 
             else: # propagate returned success == False
 
+
                 final_E = 2.0*abs(Emax)
                 #print("error in propagate_lammps NVE, setting final_E = 2*abs(Emax) =" , final_E)
 
@@ -1208,8 +1224,6 @@ def do_MD_atom_walk(at, movement_args, Emax, KEmax):
     if movement_args['MD_atom_velo_post_perturb']:
 
         do_MC_atom_velo_walk(at, movement_args, Emax, nD, KEmax)
-
-
 
     return {'MD_atom' : (1, n_accept) }
 
@@ -1515,6 +1529,7 @@ def min_aspect_ratio(vol, cell):
     return min_aspect_ratio
 
 def do_cell_step(at, Emax, p_accept, transform):
+    
     if p_accept < 1.0 and rng.float_uniform(0.0,1.0) > p_accept:
         return False
 
@@ -1560,7 +1575,7 @@ def do_cell_step(at, Emax, p_accept, transform):
         if not movement_args["rigid_bonds"]:
             at.set_cell(orig_cell,scale_atoms=False)
         else:
-            set_cell_rigid(at,new_cell, molecule_size = movement_args["molecule_size"])
+            set_cell_rigid(at,orig_cell, molecule_size = movement_args["molecule_size"])
 
         at.set_positions(orig_pos)
         if ns_args['n_extra_data'] > 0:
@@ -1709,6 +1724,8 @@ def do_MC_cell_volume_step(at, movement_args, Emax, KEmax):
     else:
         return (1, {'MC_cell_volume_per_atom' : (1, 0) })
 
+    
+
 def do_MC_cell_shear_step(at, movement_args, Emax, KEmax):
 #DOC
 #DOC ``do_MC_cell_shear_step``
@@ -1821,9 +1838,6 @@ def walk_single_walker(at, movement_args, Emax, KEmax):
 #DOC
 #DOC ``walk_single_walker``
 
-
-
-
     out = {}
 
     if movement_args['do_good_load_balance']:
@@ -1872,19 +1886,15 @@ def walk_single_walker(at, movement_args, Emax, KEmax):
         out = {}
         n_model_calls_used=0
 
-
-
         #DOC \item loop while n\_model\_calls\_used < n\_model\_calls
         while n_model_calls_used < movement_args['n_model_calls']:
-
-
+    
             #DOC \item pick random item from list
             move = possible_moves[rng.int_uniform(0,len(possible_moves))]
-            
-
 
             #DOC \item do move
             (t_n_model_calls, t_out) = move(at, movement_args, Emax, KEmax)
+
             n_model_calls_used += t_n_model_calls
             accumulate_stats(out, t_out)
 
@@ -1941,7 +1951,6 @@ def full_auto_set_stepsizes(walkers, walk_stats, movement_args, comm, Emax, KEma
 #DOC
 #DOC ``full_auto_set_stepsizes``
     #DOC \item Step sizes for each (H)MC move are set via a loop which performs additional exploration moves, calibrating each step size to obtain an acceptance rate inside a specified range. 
-
     global print_prefix
 
     orig_prefix = print_prefix
